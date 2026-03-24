@@ -82,7 +82,7 @@ if __name__ == "__main__":
     filenames = ['wi29.tsp', 'dj38.tsp', 'qa194.tsp', 'uy734.tsp', 'zi929.tsp']
     for filename in filenames:
         my_cities = read_tsp_file(filename)
-        print(f"Wczytano {len(my_cities)} miast z pliku {filename}.\n")
+        print(f"\n\nWczytano {len(my_cities)} miast z pliku {filename}.\n")
 
         # Wylosuj 1000 permutacji wierzchołków i policz
         city_permutations = []
