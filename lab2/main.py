@@ -423,7 +423,7 @@ if __name__ == "__main__":
         t1 = time.time()
         c1, s1, r1 = run_invert_parallel(starts_2d, dist_matrix, neighbors)
         t1 = time.time() - t1
-        print(f"[Zadanie 1] Local Search (Invert, CL):")
+        print(f"[Zadanie 1] Local Search (Invert):")
         print(f"  Średni koszt:     {c1.mean():.2f}")
         print(f"  Średnia l. kroki: {s1.mean():.2f}")
         print(f"  Najlepszy koszt:  {c1.min()}")
@@ -443,7 +443,7 @@ if __name__ == "__main__":
         t3 = time.time()
         c3, s3, r3 = run_transpose_parallel(starts_2d, dist_matrix, neighbors)
         t3 = time.time() - t3
-        print(f"[Zadanie 3] Local Search (Transpose, CL+DLB):")
+        print(f"[Zadanie 3] Local Search (Transpose):")
         print(f"  Średni koszt:     {c3.mean():.2f}")
         print(f"  Średnia l. kroki: {s3.mean():.2f}")
         print(f"  Najlepszy koszt:  {c3.min()}")
