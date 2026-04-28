@@ -10,10 +10,8 @@ import matplotlib.pyplot as plt
 DEFAULT_K = 20
 K_MAX     = 200
 
-# ---------------------------------------------------------------------------
-# Wczytywanie danych
-# ---------------------------------------------------------------------------
 
+# Wczytywanie danych
 def read_tsp_file(filename):
     cities = []
     if not os.path.exists(filename):
@@ -274,10 +272,6 @@ def _transpose_cl_nb(route, dist_matrix, neighbors):
 
     return current_cost, steps
 
-# ---------------------------------------------------------------------------
-# Numba prange — równoległa obsługa wszystkich startów
-# ---------------------------------------------------------------------------
-
 @njit(parallel=True, cache=True, fastmath=True)
 def run_invert_parallel(starts_2d, dist_matrix, neighbors):
     n_starts = starts_2d.shape[0]
@@ -323,10 +317,7 @@ def run_transpose_parallel(starts_2d, dist_matrix, neighbors):
         routes[s] = route
     return costs, steps, routes
 
-# ---------------------------------------------------------------------------
 # Wizualizacja
-# ---------------------------------------------------------------------------
-
 def plot_route(route, cities, title, filepath):
     n = len(route)
     x = [cities[i][0] for i in route] + [cities[route[0]][0]]
@@ -378,10 +369,7 @@ def plot_route(route, cities, title, filepath):
     plt.close(fig)
     print(f"  Zapisano wykres: {filepath}")
 
-# ---------------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     print("Kompilacja Numba JIT (jednorazowo)...")
     _dm = np.array([[0,1,2],[1,0,1],[2,1,0]], dtype=np.int32)
@@ -421,7 +409,6 @@ if __name__ == "__main__":
 
         k = min(n - 1, K_MAX)
 
-        # n_starts skaluje się odwrotnie do sqrt(n); n_starts * k ≈ stała
         n_starts = min(n, max(30, int(1500 // n ** 0.5)))
 
         print(f"  k = {k}  |  n_starts = {n_starts}")
