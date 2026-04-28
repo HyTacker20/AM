@@ -2,14 +2,23 @@ import random
 import time
 import os
 import numpy as np
-import multiprocessing as mp
+from numba import njit, prange
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+DEFAULT_K = 20
+K_MAX     = 200
+
+# ---------------------------------------------------------------------------
+# Wczytywanie danych
+# ---------------------------------------------------------------------------
 
 def read_tsp_file(filename):
     cities = []
     if not os.path.exists(filename):
         print(f"Brak pliku {filename} w folderze. Zignorowano.")
         return cities
-
     with open(filename, 'r') as file:
         reading_nodes = False
         for line in file:
@@ -30,132 +39,361 @@ def create_distance_matrix(cities):
     diff = coords[:, np.newaxis, :] - coords[np.newaxis, :, :]
     return np.round(np.sqrt((diff**2).sum(axis=2))).astype(np.int32)
 
-def calc_total_distance(route, dist_matrix):
-    r = np.asarray(route)
-    return int(dist_matrix[r, np.roll(r, -1)].sum())
+def compute_neighbor_lists(dist_matrix, k):
+    n = dist_matrix.shape[0]
+    k = min(k, n - 1)
+    neighbors = np.empty((n, k), dtype=np.int32)
+    if k + 1 >= n:
+        for v in range(n):
+            idx = np.argsort(dist_matrix[v])
+            neighbors[v] = idx[idx != v][:k]
+    else:
+        for v in range(n):
+            idx = np.argpartition(dist_matrix[v], k + 1)[:k + 1]
+            idx = idx[np.argsort(dist_matrix[v, idx])]
+            neighbors[v] = idx[idx != v][:k]
+    return neighbors
 
-# --- ALGORYTMY LOCAL SEARCH (wektoryzowane przez numpy) ---
+@njit(cache=True, fastmath=True)
+def _nn_route_nb(start, dist_matrix):
+    """Greedy nearest-neighbor route starting from `start`."""
+    n = dist_matrix.shape[0]
+    visited = np.zeros(n, dtype=np.bool_)
+    route = np.empty(n, dtype=np.int32)
+    route[0] = start
+    visited[start] = True
+    for step in range(1, n):
+        cur = route[step - 1]
+        best_d = 2**30
+        best_v = -1
+        for v in range(n):
+            if not visited[v] and dist_matrix[cur, v] < best_d:
+                best_d = dist_matrix[cur, v]
+                best_v = v
+        route[step] = best_v
+        visited[best_v] = True
+    return route
 
-def local_search_invert(initial_route, dist_matrix, ii, jj):
-    """Zadanie 1: Pełne otoczenie dla INVERT"""
-    n = len(initial_route)
-    route = np.array(initial_route, dtype=np.int32)
+@njit(parallel=True, cache=True, fastmath=True)
+def generate_nn_starts(dist_matrix, start_cities):
+    """Równoległa generacja tras greedy NN dla każdego miasta startowego."""
+    n_starts = len(start_cities)
+    n = dist_matrix.shape[0]
+    starts = np.empty((n_starts, n), dtype=np.int32)
+    for s in prange(n_starts):
+        starts[s] = _nn_route_nb(start_cities[s], dist_matrix)
+    return starts
+
+@njit(cache=True, fastmath=True)
+def _invert_cl_nb(route, dist_matrix, neighbors):
+    """2-opt z candidate lists"""
+    n = len(route)
+    k = neighbors.shape[1]
+
+    position = np.empty(n, dtype=np.int32)
+    for idx in range(n):
+        position[route[idx]] = idx
+
+    current_cost = 0
+    for idx in range(n):
+        current_cost += dist_matrix[route[idx], route[(idx + 1) % n]]
+
     steps = 0
-    current_cost = calc_total_distance(route, dist_matrix)
-
     while True:
-        A = route[(ii - 1) % n]
-        B = route[ii]
-        C = route[jj]
-        D = route[(jj + 1) % n]
-        deltas = dist_matrix[A, C] + dist_matrix[B, D] - dist_matrix[A, B] - dist_matrix[C, D]
+        best_delta = 0
+        best_i = -1
+        best_j = -1
 
-        best = int(np.argmin(deltas))
-        if deltas[best] < 0:
-            i, j = int(ii[best]), int(jj[best])
-            route[i:j+1] = route[i:j+1][::-1]
-            current_cost += int(deltas[best])
+        for i in range(n):
+            A = route[i - 1] if i > 0 else route[n - 1]
+            B = route[i]
+            d_AB = dist_matrix[A, B]
+
+            for ki in range(k):
+                C = neighbors[A, ki]
+                d_AC = dist_matrix[A, C]
+                if d_AC >= d_AB:
+                    break
+                if C == B:
+                    continue
+                j = position[C]
+                if i < j:
+                    if i == 0 and j == n - 1:
+                        continue
+                    D = route[j + 1] if j < n - 1 else route[0]
+                    delta = d_AC + dist_matrix[B, D] - d_AB - dist_matrix[C, D]
+                    if delta < best_delta:
+                        best_delta = delta
+                        best_i = i
+                        best_j = j
+
+        if best_delta < 0:
+            left, right = best_i, best_j
+            while left < right:
+                tmp = route[left]
+                route[left] = route[right]
+                route[right] = tmp
+                position[route[left]] = left
+                position[route[right]] = right
+                left += 1
+                right -= 1
+            current_cost += best_delta
             steps += 1
         else:
             break
 
-    return current_cost, steps, route.tolist()
+    return current_cost, steps
 
-def local_search_random_invert(initial_route, dist_matrix):
-    """Zadanie 2: Przyspieszone otoczenie - losowe n sąsiadów"""
-    n = len(initial_route)
-    route = np.array(initial_route, dtype=np.int32)
+
+@njit(cache=True, fastmath=True)
+def _random_invert_nb(route, dist_matrix):
+    """Zadanie 2: n losowych sąsiadów (bez DLB — losowe próbkowanie)."""
+    n = len(route)
+    current_cost = 0
+    for k in range(n):
+        current_cost += dist_matrix[route[k], route[(k + 1) % n]]
+
     steps = 0
-    current_cost = calc_total_distance(route, dist_matrix)
-
     while True:
-        pairs = np.array([sorted(random.sample(range(n), 2)) for _ in range(n)])
-        valid = ~((pairs[:, 0] == 0) & (pairs[:, 1] == n - 1))
-        pairs = pairs[valid]
-        if len(pairs) == 0:
+        best_delta = 0
+        best_i = -1
+        best_j = -1
+        for _ in range(n):
+            a = np.random.randint(0, n)
+            b = np.random.randint(0, n)
+            while b == a:
+                b = np.random.randint(0, n)
+            i = a if a < b else b
+            j = b if a < b else a
+            if i == 0 and j == n - 1:
+                continue
+            A = route[i - 1] if i > 0 else route[n - 1]
+            B = route[i]
+            C = route[j]
+            D = route[j + 1] if j < n - 1 else route[0]
+            delta = (dist_matrix[A, C] + dist_matrix[B, D]
+                     - dist_matrix[A, B] - dist_matrix[C, D])
+            if delta < best_delta:
+                best_delta = delta
+                best_i = i
+                best_j = j
+        if best_delta < 0:
+            left, right = best_i, best_j
+            while left < right:
+                tmp = route[left]
+                route[left] = route[right]
+                route[right] = tmp
+                left += 1
+                right -= 1
+            current_cost += best_delta
+            steps += 1
+        else:
             break
+    return current_cost, steps
 
-        ii_r, jj_r = pairs[:, 0], pairs[:, 1]
-        A = route[(ii_r - 1) % n];  B = route[ii_r]
-        C = route[jj_r];            D = route[(jj_r + 1) % n]
-        deltas = dist_matrix[A, C] + dist_matrix[B, D] - dist_matrix[A, B] - dist_matrix[C, D]
 
-        best = int(np.argmin(deltas))
-        if deltas[best] < 0:
-            i, j = int(ii_r[best]), int(jj_r[best])
-            route[i:j+1] = route[i:j+1][::-1]
-            current_cost += int(deltas[best])
+@njit(cache=True, fastmath=True)
+def _transpose_cl_nb(route, dist_matrix, neighbors):
+    """Transpose z candidate lists (best-improvement, bez DLB)."""
+    n = len(route)
+    k = neighbors.shape[1]
+
+    position = np.empty(n, dtype=np.int32)
+    for idx in range(n):
+        position[route[idx]] = idx
+
+    current_cost = 0
+    for idx in range(n):
+        current_cost += dist_matrix[route[idx], route[(idx + 1) % n]]
+
+    steps = 0
+    while True:
+        best_delta = 0
+        best_i = -1
+        best_j = -1
+
+        for i in range(n):
+            A = route[i - 1] if i > 0 else route[n - 1]
+            B = route[i]
+            d_AB = dist_matrix[A, B]
+
+            for ki in range(k):
+                C = neighbors[A, ki]
+                d_AC = dist_matrix[A, C]
+                if d_AC >= d_AB:
+                    break
+                if C == B:
+                    continue
+                j = position[C]
+                if i == j:
+                    continue
+                ii_ = i if i < j else j
+                jj_ = j if i < j else i
+
+                if jj_ == ii_ + 1:
+                    A2 = route[ii_ - 1] if ii_ > 0 else route[n - 1]
+                    B2 = route[ii_]
+                    C2 = route[jj_]
+                    D2 = route[jj_ + 1] if jj_ < n - 1 else route[0]
+                    delta = (dist_matrix[A2, C2] + dist_matrix[B2, D2]
+                             - dist_matrix[A2, B2] - dist_matrix[C2, D2])
+                elif ii_ == 0 and jj_ == n - 1:
+                    B2 = route[0]
+                    C2 = route[n - 1]
+                    delta = (dist_matrix[C2, route[1]] + dist_matrix[route[n - 2], B2]
+                             - dist_matrix[B2, route[1]] - dist_matrix[route[n - 2], C2])
+                else:
+                    A2 = route[ii_ - 1] if ii_ > 0 else route[n - 1]
+                    B2 = route[ii_]
+                    C2 = route[ii_ + 1]
+                    X2 = route[jj_ - 1]
+                    Y2 = route[jj_]
+                    Z2 = route[jj_ + 1] if jj_ < n - 1 else route[0]
+                    old_c = (dist_matrix[A2, B2] + dist_matrix[B2, C2]
+                             + dist_matrix[X2, Y2] + dist_matrix[Y2, Z2])
+                    new_c = (dist_matrix[A2, Y2] + dist_matrix[Y2, C2]
+                             + dist_matrix[X2, B2] + dist_matrix[B2, Z2])
+                    delta = new_c - old_c
+
+                if delta < best_delta:
+                    best_delta = delta
+                    best_i = ii_
+                    best_j = jj_
+
+        if best_delta < 0:
+            i2, j2 = best_i, best_j
+            tmp = route[i2]
+            route[i2] = route[j2]
+            route[j2] = tmp
+            position[route[i2]] = i2
+            position[route[j2]] = j2
+            current_cost += best_delta
             steps += 1
         else:
             break
 
-    return current_cost, steps, route.tolist()
+    return current_cost, steps
 
-def local_search_transpose(initial_route, dist_matrix, ii, jj, linear_adj, cyclic_adj, non_adj):
-    """Zadanie 3 (Dla 2 roku): Pełne otoczenie dla TRANSPOSE"""
-    n = len(initial_route)
-    route = np.array(initial_route, dtype=np.int32)
-    steps = 0
-    current_cost = calc_total_distance(route, dist_matrix)
+# ---------------------------------------------------------------------------
+# Numba prange — równoległa obsługa wszystkich startów
+# ---------------------------------------------------------------------------
 
-    while True:
-        deltas = np.zeros(len(ii), dtype=np.int64)
+@njit(parallel=True, cache=True, fastmath=True)
+def run_invert_parallel(starts_2d, dist_matrix, neighbors):
+    n_starts = starts_2d.shape[0]
+    n = starts_2d.shape[1]
+    costs  = np.empty(n_starts, dtype=np.int64)
+    steps  = np.empty(n_starts, dtype=np.int64)
+    routes = np.empty((n_starts, n), dtype=np.int32)
+    for s in prange(n_starts):
+        route = starts_2d[s].copy()
+        cost, st = _invert_cl_nb(route, dist_matrix, neighbors)
+        costs[s] = cost
+        steps[s] = st
+        routes[s] = route
+    return costs, steps, routes
 
-        # Sąsiedzi liniowi (j == i+1)
-        if linear_adj.any():
-            idx = linear_adj
-            A = route[(ii[idx] - 1) % n];  B = route[ii[idx]]
-            C = route[jj[idx]];            D = route[(jj[idx] + 1) % n]
-            deltas[idx] = dist_matrix[A, C] + dist_matrix[B, D] - dist_matrix[A, B] - dist_matrix[C, D]
+@njit(parallel=True, cache=True, fastmath=True)
+def run_random_invert_parallel(starts_2d, dist_matrix):
+    n_starts = starts_2d.shape[0]
+    n = starts_2d.shape[1]
+    costs  = np.empty(n_starts, dtype=np.int64)
+    steps  = np.empty(n_starts, dtype=np.int64)
+    routes = np.empty((n_starts, n), dtype=np.int32)
+    for s in prange(n_starts):
+        route = starts_2d[s].copy()
+        cost, st = _random_invert_nb(route, dist_matrix)
+        costs[s] = cost
+        steps[s] = st
+        routes[s] = route
+    return costs, steps, routes
 
-        # Sąsiedzi cykliczni (i=0, j=n-1)
-        if cyclic_adj.any():
-            B_c = route[0];  C_c = route[n - 1]
-            deltas[cyclic_adj] = (dist_matrix[C_c, route[1]] + dist_matrix[route[n - 2], B_c]
-                                  - dist_matrix[B_c, route[1]] - dist_matrix[route[n - 2], C_c])
+@njit(parallel=True, cache=True, fastmath=True)
+def run_transpose_parallel(starts_2d, dist_matrix, neighbors):
+    n_starts = starts_2d.shape[0]
+    n = starts_2d.shape[1]
+    costs  = np.empty(n_starts, dtype=np.int64)
+    steps  = np.empty(n_starts, dtype=np.int64)
+    routes = np.empty((n_starts, n), dtype=np.int32)
+    for s in prange(n_starts):
+        route = starts_2d[s].copy()
+        cost, st = _transpose_cl_nb(route, dist_matrix, neighbors)
+        costs[s] = cost
+        steps[s] = st
+        routes[s] = route
+    return costs, steps, routes
 
-        # Nie-sąsiedzi
-        if non_adj.any():
-            idx = non_adj
-            A = route[(ii[idx] - 1) % n];  B = route[ii[idx]];  C = route[(ii[idx] + 1) % n]
-            X = route[(jj[idx] - 1) % n];  Y = route[jj[idx]];  Z = route[(jj[idx] + 1) % n]
-            old_c = dist_matrix[A, B] + dist_matrix[B, C] + dist_matrix[X, Y] + dist_matrix[Y, Z]
-            new_c = dist_matrix[A, Y] + dist_matrix[Y, C] + dist_matrix[X, B] + dist_matrix[B, Z]
-            deltas[idx] = new_c - old_c
+# ---------------------------------------------------------------------------
+# Wizualizacja
+# ---------------------------------------------------------------------------
 
-        best = int(np.argmin(deltas))
-        if deltas[best] < 0:
-            i, j = int(ii[best]), int(jj[best])
-            route[i], route[j] = int(route[j]), int(route[i])
-            current_cost += int(deltas[best])
-            steps += 1
-        else:
-            break
+def plot_route(route, cities, title, filepath):
+    n = len(route)
+    x = [cities[i][0] for i in route] + [cities[route[0]][0]]
+    y = [cities[i][1] for i in route] + [cities[route[0]][1]]
 
-    return current_cost, steps, route.tolist()
+    line_width = max(0.8, min(2.2, 240 / max(n, 1)))
+    point_size = max(6, min(60, int(1800 / max(n, 1))))
 
-# --- MULTIPROCESSING: worker state (inicjalizowany raz na proces) ---
+    fig, ax = plt.subplots(figsize=(10, 7), dpi=180)
+    ax.set_facecolor('#f7f7f7')
+    ax.plot(x, y, linestyle='-', color='#1f5aa6', linewidth=line_width, alpha=0.9, zorder=1)
+    ax.scatter(
+        x[:-1],
+        y[:-1],
+        color='#1f5aa6',
+        s=point_size,
+        edgecolor='white',
+        linewidth=0.4,
+        alpha=0.95,
+        zorder=2,
+    )
+    ax.scatter(
+        [x[0]],
+        [y[0]],
+        marker='s',
+        color='#d62728',
+        s=point_size * 2.2,
+        edgecolor='white',
+        linewidth=0.6,
+        label='Start',
+        zorder=3,
+    )
+    ax.set_title(title)
+    ax.set_xlabel('Koordynata X')
+    ax.set_ylabel('Koordynata Y')
+    ax.legend(frameon=True, framealpha=0.9)
+    ax.grid(True, linestyle='--', linewidth=0.6, alpha=0.4)
+    ax.set_aspect('equal', adjustable='box')
 
-_W = {}  # worker-local state
+    xmin, xmax = min(x), max(x)
+    ymin, ymax = min(y), max(y)
+    x_pad = (xmax - xmin) * 0.03 if xmax > xmin else 1.0
+    y_pad = (ymax - ymin) * 0.03 if ymax > ymin else 1.0
+    ax.set_xlim(xmin - x_pad, xmax + x_pad)
+    ax.set_ylim(ymin - y_pad, ymax + y_pad)
 
-def _pool_init(dm, ii_i, jj_i, ii_t, jj_t, la, ca, na):
-    _W['dm'] = dm
-    _W['ii_inv'] = ii_i;  _W['jj_inv'] = jj_i
-    _W['ii_tr']  = ii_t;  _W['jj_tr']  = jj_t
-    _W['la'] = la;  _W['ca'] = ca;  _W['na'] = na
+    fig.tight_layout()
+    fig.savefig(filepath)
+    plt.close(fig)
+    print(f"  Zapisano wykres: {filepath}")
 
-def _task_invert(route):
-    return local_search_invert(route, _W['dm'], _W['ii_inv'], _W['jj_inv'])
-
-def _task_random_invert(route):
-    return local_search_random_invert(route, _W['dm'])
-
-def _task_transpose(route):
-    return local_search_transpose(route, _W['dm'], _W['ii_tr'], _W['jj_tr'], _W['la'], _W['ca'], _W['na'])
-
-# --- MAIN ---
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    print("Kompilacja Numba JIT (jednorazowo)...")
+    _dm = np.array([[0,1,2],[1,0,1],[2,1,0]], dtype=np.int32)
+    _ne = np.array([[1,2],[0,2],[1,0]], dtype=np.int32)
+    _s2 = np.array([[0,1,2],[2,0,1]], dtype=np.int32)
+    _sc = np.array([0,1], dtype=np.int32)
+    generate_nn_starts(_dm, _sc)
+    run_invert_parallel(_s2, _dm, _ne)
+    run_random_invert_parallel(_s2, _dm)
+    run_transpose_parallel(_s2, _dm, _ne)
+    print("Gotowo.\n")
+
     filenames = [
         'wi29.tsp',
         'dj38.tsp',
@@ -169,9 +407,6 @@ if __name__ == "__main__":
         'mu1979.tsp'
     ]
 
-    ncpus = mp.cpu_count()
-    print(f"Używam {ncpus} rdzeni CPU\n")
-
     for filename in filenames:
         my_cities = read_tsp_file(filename)
         n = len(my_cities)
@@ -183,59 +418,55 @@ if __name__ == "__main__":
         print(f"==================================================")
 
         dist_matrix = create_distance_matrix(my_cities)
-        starts = [random.sample(range(n), n) for _ in range(n)]
 
-        ii_inv, jj_inv = np.triu_indices(n, k=1)
-        valid = ~((ii_inv == 0) & (jj_inv == n - 1))
-        ii_inv, jj_inv = ii_inv[valid], jj_inv[valid]
+        k = min(n - 1, K_MAX)
 
-        ii_tr, jj_tr = np.triu_indices(n, k=1)
-        linear_adj = (jj_tr == ii_tr + 1)
-        cyclic_adj  = (ii_tr == 0) & (jj_tr == n - 1)
-        non_adj     = ~linear_adj & ~cyclic_adj
+        # n_starts skaluje się odwrotnie do sqrt(n); n_starts * k ≈ stała
+        n_starts = min(n, max(30, int(1500 // n ** 0.5)))
 
-        initargs = (dist_matrix, ii_inv, jj_inv, ii_tr, jj_tr, linear_adj, cyclic_adj, non_adj)
+        print(f"  k = {k}  |  n_starts = {n_starts}")
+        t_pre = time.time()
+        neighbors = compute_neighbor_lists(dist_matrix, k)
+        print(f"  Prekomputacja sąsiadów: {time.time() - t_pre:.2f} s")
 
-        with mp.Pool(ncpus, initializer=_pool_init, initargs=initargs) as pool:
+        starts_list = [random.sample(range(n), n) for _ in range(n_starts)]
+        starts_2d = np.array(starts_list, dtype=np.int32)
 
-            # --- ZADANIE 1 ---
-            t1 = time.time()
-            res_z1 = pool.map(_task_invert, starts)
-            t1 = time.time() - t1
+        # --- Zadanie 1: Invert ---
+        t1 = time.time()
+        c1, s1, r1 = run_invert_parallel(starts_2d, dist_matrix, neighbors)
+        t1 = time.time() - t1
+        print(f"[Zadanie 1] Local Search (Invert, CL):")
+        print(f"  Średni koszt:     {c1.mean():.2f}")
+        print(f"  Średnia l. kroki: {s1.mean():.2f}")
+        print(f"  Najlepszy koszt:  {c1.min()}")
+        print(f"  Czas obliczeń:    {t1:.2f} s\n")
 
-            avg_cost_1  = sum(r[0] for r in res_z1) / n
-            avg_steps_1 = sum(r[1] for r in res_z1) / n
-            best_cost_1 = min(r[0] for r in res_z1)
-            print(f"[Zadanie 1] Local Search (Invert) - Pełne sąsiedztwo:")
-            print(f"  Średni koszt:     {avg_cost_1:.2f}")
-            print(f"  Średnia l. kroki: {avg_steps_1:.2f}")
-            print(f"  Najlepszy koszt:  {best_cost_1}")
-            print(f"  Czas obliczeń:    {t1:.2f} s\n")
+        # --- Zadanie 2: Random Invert ---
+        t2 = time.time()
+        c2, s2, r2 = run_random_invert_parallel(starts_2d, dist_matrix)
+        t2 = time.time() - t2
+        print(f"[Zadanie 2] Local Search (Random Invert, {n} sąsiadów):")
+        print(f"  Średni koszt:     {c2.mean():.2f}")
+        print(f"  Średnia l. kroki: {s2.mean():.2f}")
+        print(f"  Najlepszy koszt:  {c2.min()}")
+        print(f"  Czas obliczeń:    {t2:.2f} s\n")
 
-            # --- ZADANIE 2 ---
-            t2 = time.time()
-            res_z2 = pool.map(_task_random_invert, starts)
-            t2 = time.time() - t2
+        # --- Zadanie 3: Transpose ---
+        t3 = time.time()
+        c3, s3, r3 = run_transpose_parallel(starts_2d, dist_matrix, neighbors)
+        t3 = time.time() - t3
+        print(f"[Zadanie 3] Local Search (Transpose, CL+DLB):")
+        print(f"  Średni koszt:     {c3.mean():.2f}")
+        print(f"  Średnia l. kroki: {s3.mean():.2f}")
+        print(f"  Najlepszy koszt:  {c3.min()}")
+        print(f"  Czas obliczeń:    {t3:.2f} s\n")
 
-            avg_cost_2  = sum(r[0] for r in res_z2) / n
-            avg_steps_2 = sum(r[1] for r in res_z2) / n
-            best_cost_2 = min(r[0] for r in res_z2)
-            print(f"[Zadanie 2] Local Search (Random Invert) - {n} sąsiadów:")
-            print(f"  Średni koszt:     {avg_cost_2:.2f}")
-            print(f"  Średnia l. kroki: {avg_steps_2:.2f}")
-            print(f"  Najlepszy koszt:  {best_cost_2}")
-            print(f"  Czas obliczeń:    {t2:.2f} s\n")
-
-            # --- ZADANIE 3 ---
-            t3 = time.time()
-            res_z3 = pool.map(_task_transpose, starts)
-            t3 = time.time() - t3
-
-            avg_cost_3  = sum(r[0] for r in res_z3) / n
-            avg_steps_3 = sum(r[1] for r in res_z3) / n
-            best_cost_3 = min(r[0] for r in res_z3)
-            print(f"[Zadanie 3] Local Search (Transpose) - Pełne sąsiedztwo:")
-            print(f"  Średni koszt:     {avg_cost_3:.2f}")
-            print(f"  Średnia l. kroki: {avg_steps_3:.2f}")
-            print(f"  Najlepszy koszt:  {best_cost_3}")
-            print(f"  Czas obliczeń:    {t3:.2f} s\n")
+        # Wykresy
+        base = filename.replace('.tsp', '')
+        best1 = r1[int(np.argmin(c1))].tolist()
+        best2 = r2[int(np.argmin(c2))].tolist()
+        best3 = r3[int(np.argmin(c3))].tolist()
+        plot_route(best1, my_cities, f"{base} — Invert (koszt: {int(c1.min())})",        f"{base}_z1_invert.png")
+        plot_route(best2, my_cities, f"{base} — Random Invert (koszt: {int(c2.min())})", f"{base}_z2_random.png")
+        plot_route(best3, my_cities, f"{base} — Transpose (koszt: {int(c3.min())})",     f"{base}_z3_transpose.png")
